@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              explorer-git-status-chip
 // @name            Explorer Git Status Chip
-// @description     Appends [branch*] to Explorer window titles when the folder is a git repo; detects dirty via porcelain or heuristics
-// @version         1.0.0
+// @description     Appends [#git:branch*] to Explorer window titles when the folder is a git repo; detects dirty via porcelain or heuristics
+// @version         1.0.1
 // @author          Leorik69
 // @github          https://github.com/Leorik69
 // @include         explorer.exe
@@ -22,18 +22,20 @@ when the open folder is inside a git repository.
 - Polls Explorer windows and resolves the folder path via Shell Windows COM
 - Reads `.git/HEAD` (and packed-refs if needed) for the branch name
 - Detects dirty state via `git status --porcelain` when git.exe is available,
-  otherwise uses simple index/worktree mtime heuristics
-- Appends ` [branch*]` to the title; restores original titles on unload
+  otherwise uses simple index/worktree mtime heuristics (briefly cached)
+- Appends a unique chip ` [#git:branch*]` to the title; restores on unload
 
 ## Settings
 - **enabled** — master switch
 - **showDirty** — append `*` when the worktree is dirty
 - **maxBranchLen** — truncate long branch names
-- **pollMs** — how often to refresh (milliseconds)
+- **pollMs** — how often to refresh (milliseconds; default 9000)
 
-## Notes
-Best-effort; nested worktrees and some gitlayouts may not resolve. Title
-updates only apply to Explorer browser windows.
+## Notes / SL mitigations (v1.0.1)
+Default poll is ~9s (was 2s). `CoInitializeEx` runs once per worker thread
+lifetime, not every cycle. `StripChip` only removes the `#git:` marker pattern,
+never arbitrary `[…]` title suffixes. Dirty status is cached briefly per path.
+Best-effort; nested/worktree edge cases may not resolve.
 */
 // ==/WindhawkModReadme==
 
@@ -48,9 +50,9 @@ updates only apply to Explorer browser windows.
 - maxBranchLen: 32
   $name: Max branch length
   $description: Truncate branch names longer than this
-- pollMs: 2000
+- pollMs: 9000
   $name: Poll interval (ms)
-  $description: How often to refresh titles (500–30000)
+  $description: How often to refresh titles (500–30000; default 9000)
 */
 // ==/WindhawkModSettings==
 
@@ -74,12 +76,23 @@ namespace fs = std::filesystem;
 static bool g_enabled = true;
 static bool g_showDirty = true;
 static int g_maxBranchLen = 32;
-static int g_pollMs = 2000;
+static int g_pollMs = 9000;
 
 static HANDLE g_pollThread = nullptr;
 static HANDLE g_stopEvent = nullptr;
 static std::mutex g_titleMutex;
 static std::unordered_map<HWND, std::wstring> g_originalTitles;
+
+// Unique chip open marker — StripChip must NEVER match arbitrary "[…]" suffixes
+static constexpr wchar_t kChipPrefix[] = L" [#git:";
+
+struct DirtyCacheEntry {
+    bool dirty = false;
+    std::chrono::steady_clock::time_point at{};
+};
+static std::mutex g_dirtyCacheMutex;
+static std::unordered_map<std::wstring, DirtyCacheEntry> g_dirtyCache;
+static constexpr auto kDirtyCacheTtl = std::chrono::seconds(8);
 
 static void LoadSettings() {
     g_enabled = Wh_GetIntSetting(L"enabled") != 0;
@@ -273,13 +286,50 @@ static std::wstring TruncateBranch(const std::wstring& b) {
 }
 
 static std::wstring StripChip(const std::wstring& title) {
-    // Remove trailing " [something]" chip we may have added
-    auto pos = title.rfind(L" [");
+    // Only remove THIS mod's chip: " [#git:<branch>*]" — never arbitrary "[…]"
+    auto pos = title.rfind(kChipPrefix);
     if (pos == std::wstring::npos) return title;
     if (title.back() != L']') return title;
-    // Only strip if it looks like our chip (no nested brackets after pos)
-    if (title.find(L'[', pos + 1) != std::wstring::npos) return title;
+    // Remainder after prefix must be branch[+*] then closing ']'
+    const size_t prefixLen = sizeof(kChipPrefix) / sizeof(wchar_t) - 1;
+    std::wstring rest = title.substr(pos + prefixLen);
+    if (rest.size() < 2 || rest.back() != L']') return title;
+    rest.pop_back();  // drop ']'
+    if (!rest.empty() && rest.back() == L'*') rest.pop_back();
+    if (rest.empty()) return title;
+    // Reject if leftover still contains our marker / brackets (not our chip)
+    if (rest.find(L'[') != std::wstring::npos || rest.find(L']') != std::wstring::npos)
+        return title;
     return title.substr(0, pos);
+}
+
+static std::wstring MakeChip(const std::wstring& branch, bool dirty) {
+    std::wstring chip = kChipPrefix;
+    chip += TruncateBranch(branch);
+    if (dirty) chip += L"*";
+    chip += L"]";
+    return chip;
+}
+
+static bool IsDirtyCached(const fs::path& gitDir, const fs::path& workTree) {
+    const std::wstring key = workTree.wstring();
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(g_dirtyCacheMutex);
+        auto it = g_dirtyCache.find(key);
+        if (it != g_dirtyCache.end() && (now - it->second.at) < kDirtyCacheTtl)
+            return it->second.dirty;
+    }
+    bool dirty = false;
+    if (GitExeAvailable())
+        dirty = IsDirtyViaGit(workTree);
+    else
+        dirty = IsDirtyHeuristic(gitDir, workTree);
+    {
+        std::lock_guard<std::mutex> lock(g_dirtyCacheMutex);
+        g_dirtyCache[key] = DirtyCacheEntry{dirty, now};
+    }
+    return dirty;
 }
 
 struct ExplorerWin {
@@ -288,13 +338,12 @@ struct ExplorerWin {
 };
 
 static std::vector<ExplorerWin> EnumExplorerFolders() {
+    // COM must already be initialized on this thread (once in PollThreadProc).
     std::vector<ExplorerWin> result;
-    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     IShellWindows* psw = nullptr;
     HRESULT hr = CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL,
                                   IID_IShellWindows, (void**)&psw);
     if (FAILED(hr) || !psw) {
-        if (SUCCEEDED(hrInit)) CoUninitialize();
         return result;
     }
     long count = 0;
@@ -351,7 +400,6 @@ static std::vector<ExplorerWin> EnumExplorerFolders() {
         disp->Release();
     }
     psw->Release();
-    if (SUCCEEDED(hrInit)) CoUninitialize();
     return result;
 }
 
@@ -396,28 +444,20 @@ static void ApplyTitles() {
         if (branch.empty()) continue;
 
         bool dirty = false;
-        if (g_showDirty) {
-            if (GitExeAvailable())
-                dirty = IsDirtyViaGit(workTree);
-            else
-                dirty = IsDirtyHeuristic(gitDir, workTree);
-        }
+        if (g_showDirty)
+            dirty = IsDirtyCached(gitDir, workTree);
 
-        std::wstring chip = L" [" + TruncateBranch(Utf8ToWide(branch));
-        if (dirty) chip += L"*";
-        chip += L"]";
+        std::wstring chip = MakeChip(Utf8ToWide(branch), dirty);
 
         wchar_t curTitle[512];
         GetWindowTextW(w.hwnd, curTitle, 512);
         std::wstring base = StripChip(curTitle);
         if (g_originalTitles.find(w.hwnd) == g_originalTitles.end())
             g_originalTitles[w.hwnd] = base;
-        else
-            base = StripChip(g_originalTitles[w.hwnd].empty() ? base : g_originalTitles[w.hwnd]);
-
-        // Prefer storing first-seen clean title
-        if (g_originalTitles[w.hwnd].find(L" [") != std::wstring::npos)
+        else {
+            // Keep first-seen clean title; strip only our marker if it leaked in
             g_originalTitles[w.hwnd] = StripChip(g_originalTitles[w.hwnd]);
+        }
 
         std::wstring newTitle = g_originalTitles[w.hwnd] + chip;
         if (wcscmp(curTitle, newTitle.c_str()) != 0) {
@@ -446,7 +486,10 @@ static void RestoreAllTitles() {
 }
 
 static DWORD WINAPI PollThreadProc(LPVOID) {
-    Wh_Log(L"Git status chip poll thread started");
+    // CoInitializeEx once for the worker thread lifetime (not every poll cycle)
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    Wh_Log(L"Git status chip poll thread started (CoInit hr=0x%08X poll=%d)",
+           (unsigned)hrInit, g_pollMs);
     while (WaitForSingleObject(g_stopEvent, g_pollMs) == WAIT_TIMEOUT) {
         try {
             ApplyTitles();
@@ -454,6 +497,8 @@ static DWORD WINAPI PollThreadProc(LPVOID) {
             Wh_Log(L"Exception in ApplyTitles");
         }
     }
+    if (SUCCEEDED(hrInit))
+        CoUninitialize();
     Wh_Log(L"Git status chip poll thread exiting");
     return 0;
 }

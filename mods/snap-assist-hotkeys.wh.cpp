@@ -2,7 +2,7 @@
 // @id              snap-assist-hotkeys
 // @name            Snap Assist Hotkeys
 // @description     Number-key snap targets and optional overlay when Snap Assist is active; maps 1-9 to windows on the current monitor
-// @version         1.0.0
+// @version         1.0.2
 // @author          Leorik69
 // @github          https://github.com/Leorik69
 // @include         explorer.exe
@@ -15,26 +15,31 @@
 /*
 # Snap Assist Hotkeys
 
-When Windows Snap Assist (or a similar snap UI) appears, press **1–9** to
+When Windows Snap Assist / Snap Layouts UI is actually visible, press **1–9** to
 activate the Nth visible top-level window on the current monitor. An optional
 numbered overlay lists candidates.
 
 ## How it works
-- Polls the foreground window class/title for Snap Assist heuristics
-  (`XamlExplorerHostIslandWindow`, titles containing "Snap", etc.)
-- Builds a candidate list via EnumWindows filtered to the monitor
-- Low-level keyboard hook maps digit keys while Snap Assist mode is armed
-- Overlay is a layered WS_EX_TOPMOST window; destroyed when Snap Assist ends
+- Tight detection: only arms when a snap overlay is confidently visible
+  (process explorer.exe + Snap Assist / Snap Layouts class+title checks;
+  MultitaskingViewFrame only with Snap in title). Broad classes like bare `XamlExplorerHostIslandWindow`
+  or `ForegroundStaging` alone no longer arm the hook.
+- Optional **requireWinKey**: only intercept digits while Win is held (extra
+  safety if detection still false-positives on your build).
+- WH_KEYBOARD_LL only eats keys 1–9 while armed; otherwise keys pass through.
+- Overlay is a layered WS_EX_TOPMOST window; destroyed when Snap Assist ends.
 
 ## Settings
 - **enableOverlay** — show numbered list overlay
-- **enableDigits** — map keys 1–9 to candidates
+- **enableDigits** — map keys 1–9 to candidates while snap UI is armed
 - **maxWindows** — max candidates (1–9)
+- **requireWinKey** — only intercept digits while the Windows key is held
 
-## Limitations
-Snap Assist UI classes vary by Windows build; detection is heuristic. If Snap
-Assist is not detected, you can still trigger candidate mode with Win+Z-like
-timing by snapping a window first — the mod arms when heuristics match.
+## Limitations / mitigations (SL review)
+Earlier builds matched XamlExplorerHostIslandWindow / ForegroundStaging too
+broadly and could eat digits globally. v1.0.2 narrows detection and adds
+requireWinKey so LL hook never swallows 1–9 unless snap overlay is detected
+(and optionally Win is held).
 */
 // ==/WindhawkModReadme==
 
@@ -45,10 +50,13 @@ timing by snapping a window first — the mod arms when heuristics match.
   $description: Show a numbered list of snap targets
 - enableDigits: true
   $name: Enable digit hotkeys
-  $description: Map keys 1-9 to window candidates while Snap Assist is active
+  $description: Map keys 1-9 only while snap overlay is detected (keys pass through otherwise)
 - maxWindows: 9
   $name: Max windows
   $description: Maximum number of candidates (1-9)
+- requireWinKey: false
+  $name: Require Win key
+  $description: Only intercept digits while the Windows key is also held (extra false-positive guard)
 */
 // ==/WindhawkModSettings==
 
@@ -62,6 +70,7 @@ timing by snapping a window first — the mod arms when heuristics match.
 static bool g_enableOverlay = true;
 static bool g_enableDigits = true;
 static int g_maxWindows = 9;
+static bool g_requireWinKey = false;
 
 static HHOOK g_kbHook = nullptr;
 static HANDLE g_pollThread = nullptr;
@@ -79,24 +88,71 @@ static void LoadSettings() {
     g_maxWindows = Wh_GetIntSetting(L"maxWindows");
     if (g_maxWindows < 1) g_maxWindows = 1;
     if (g_maxWindows > 9) g_maxWindows = 9;
+    g_requireWinKey = Wh_GetIntSetting(L"requireWinKey") != 0;
+}
+
+static bool IsExplorerProcess(HWND hwnd) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid) return false;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    wchar_t path[MAX_PATH]{};
+    DWORD sz = MAX_PATH;
+    bool ok = QueryFullProcessImageNameW(h, 0, path, &sz) != 0;
+    CloseHandle(h);
+    if (!ok) return false;
+    const wchar_t* base = wcsrchr(path, L'\\');
+    base = base ? base + 1 : path;
+    return _wcsicmp(base, L"explorer.exe") == 0;
 }
 
 static bool IsSnapAssistWindow(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd)) return false;
+    if (!IsWindowVisible(hwnd)) return false;
+
     wchar_t cls[256]{};
     wchar_t title[256]{};
     GetClassNameW(hwnd, cls, 256);
     GetWindowTextW(hwnd, title, 256);
 
-    // Heuristics across Win10/11 builds
-    if (_wcsicmp(cls, L"XamlExplorerHostIslandWindow") == 0) return true;
-    if (_wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0) {
-        if (wcsstr(title, L"Snap") || wcsstr(title, L"snap")) return true;
+    // Tight checks only — do NOT match bare XamlExplorerHostIslandWindow or
+    // ForegroundStaging (those host many non-snap UIs and caused global digit eat).
+
+    // MultitaskingViewFrame hosts Alt+Tab AND Snap Assist — only arm when
+    // title strongly indicates snap (bare MTV = Alt+Tab/Task View, do not eat digits).
+    if (_wcsicmp(cls, L"MultitaskingViewFrame") == 0) {
+        if (wcsstr(title, L"Snap Assist") != nullptr ||
+            wcsstr(title, L"Snap Layouts") != nullptr ||
+            wcsstr(title, L"Snap layouts") != nullptr ||
+            wcsstr(title, L"Snap") != nullptr)
+            return true;
+        return false;
     }
-    if (wcsstr(cls, L"Snap") || wcsstr(title, L"Snap Assist")) return true;
-    if (_wcsicmp(cls, L"MultitaskingViewFrame") == 0) return true;
-    // Win11 snap layouts flyout sometimes hosted in Shell_TrayWnd children — skip tray
-    if (_wcsicmp(cls, L"ForegroundStaging") == 0) return true;
+
+    // Explicit Snap in class name (SnapAssistFlyout, etc.)
+    if (wcsstr(cls, L"SnapAssist") != nullptr) return true;
+    if (wcsstr(cls, L"SnapLayout") != nullptr) return true;
+
+    // Title strongly indicates Snap Assist / Snap Layouts
+    if (wcsstr(title, L"Snap Assist") != nullptr) return true;
+    if (wcsstr(title, L"Snap Layouts") != nullptr) return true;
+    if (wcsstr(title, L"Snap layouts") != nullptr) return true;
+
+    // CoreWindow / XAML island only when explorer-hosted AND title mentions Snap
+    if (_wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0 ||
+        _wcsicmp(cls, L"XamlExplorerHostIslandWindow") == 0) {
+        if ((wcsstr(title, L"Snap") != nullptr || wcsstr(title, L"snap") != nullptr) &&
+            IsExplorerProcess(hwnd)) {
+            RECT rc{};
+            if (GetWindowRect(hwnd, &rc)) {
+                int w = rc.right - rc.left;
+                int h = rc.bottom - rc.top;
+                // Snap overlays are typically sizable popups, not tiny staging HWNDs
+                if (w >= 120 && h >= 80) return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -290,7 +346,14 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             std::lock_guard<std::mutex> lock(g_mutex);
             snap = g_snapActive;
         }
+        // Pass through unless snap overlay is actively detected
         if (snap && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+            if (g_requireWinKey) {
+                bool winDown = (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
+                               (GetAsyncKeyState(VK_RWIN) & 0x8000);
+                if (!winDown)
+                    return CallNextHookEx(g_kbHook, nCode, wParam, lParam);
+            }
             int digit = -1;
             if (kb->vkCode >= '1' && kb->vkCode <= '9')
                 digit = (int)(kb->vkCode - '0');
@@ -298,7 +361,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 digit = (int)(kb->vkCode - VK_NUMPAD1 + 1);
             if (digit >= 1 && digit <= g_maxWindows) {
                 ActivateCandidate(digit);
-                return 1; // eat key
+                return 1; // eat key only while armed
             }
         }
     }
@@ -381,6 +444,6 @@ void Wh_ModUninit() {
 
 void Wh_ModSettingsChanged() {
     LoadSettings();
-    Wh_Log(L"Settings changed: overlay=%d digits=%d max=%d",
-           (int)g_enableOverlay, (int)g_enableDigits, g_maxWindows);
+    Wh_Log(L"Settings changed: overlay=%d digits=%d max=%d requireWin=%d",
+           (int)g_enableOverlay, (int)g_enableDigits, g_maxWindows, (int)g_requireWinKey);
 }
