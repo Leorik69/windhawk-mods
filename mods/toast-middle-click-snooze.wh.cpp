@@ -2,7 +2,7 @@
 // @id              toast-middle-click-snooze
 // @name            Toast Middle-Click Snooze
 // @description     Middle-click a Windows toast to dismiss it and get a reminder after N minutes (best-effort snooze)
-// @version         1.0.0
+// @version         1.0.1
 // @author          Leorik69
 // @github          https://github.com/Leorik69
 // @include         ShellExperienceHost.exe
@@ -23,7 +23,7 @@ after a configurable delay (15 / 30 / 60 minutes).
 ## How it works
 - Installs a `WH_MOUSE_LL` hook
 - On middle-button down, hit-tests the window under the cursor
-- Matches toast-like classes (`Windows.UI.Core.CoreWindow`, toast frame heuristics)
+- Matches toast classes only with size/corner geometry (CoreWindow alone is not enough)
 - Posts close/hide to the toast window and starts a one-shot timer
 - Reminder is delivered via tray balloon (`Shell_NotifyIcon`) or `MessageBoxW`
   fallback when the OS Action Center snooze API is unavailable
@@ -89,6 +89,25 @@ static void LoadSettings() {
     else g_snoozeMinutes = 60;
 }
 
+static bool LooksLikeToastGeometry(HWND hwnd) {
+    RECT rc{};
+    if (!GetWindowRect(hwnd, &rc)) return false;
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+    if (w < 180 || w > 720) return false;
+    if (h < 48 || h > 420) return false;
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    // Toasts sit in a corner band (usually top-right on Win11)
+    bool nearRight = rc.right >= screenW - 40;
+    bool nearTop = rc.top <= 120;
+    bool nearBottom = rc.bottom >= screenH - 120;
+    if (!(nearRight && (nearTop || nearBottom))) return false;
+    // Exclude full-screen / huge hosts
+    if (w > screenW * 3 / 4 || h > screenH / 2) return false;
+    return true;
+}
+
 static bool IsToastLikeWindow(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd)) return false;
     wchar_t cls[256]{};
@@ -96,18 +115,32 @@ static bool IsToastLikeWindow(HWND hwnd) {
     GetClassNameW(hwnd, cls, 256);
     GetWindowTextW(hwnd, title, 256);
 
-    if (_wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0) return true;
-    if (_wcsicmp(cls, L"Windows.UI.Input.InputSite.WindowClass") == 0) return true;
-    if (wcsstr(cls, L"Toast") != nullptr) return true;
-    if (wcsstr(cls, L"Notification") != nullptr) return true;
-    if (_wcsicmp(cls, L"ApplicationFrameWindow") == 0) {
-        // Narrow: only if title suggests toast host
-        if (wcsstr(title, L"New notification") || wcsstr(title, L"Notification"))
-            return true;
-    }
-    // Win11 toast sometimes under DesktopWindowXamlSource host
-    if (wcsstr(cls, L"Xaml_WindowedPopupClass") != nullptr) return true;
     if (_wcsicmp(cls, L"Shell_TrayWnd") == 0) return false;
+    if (_wcsicmp(cls, L"Shell_SecondaryTrayWnd") == 0) return false;
+
+    // Explicit toast / notification class names — still require toast-like geometry
+    if (wcsstr(cls, L"Toast") != nullptr || wcsstr(cls, L"Notification") != nullptr) {
+        return LooksLikeToastGeometry(hwnd);
+    }
+    if (wcsstr(cls, L"Xaml_WindowedPopupClass") != nullptr) {
+        return LooksLikeToastGeometry(hwnd);
+    }
+    if (_wcsicmp(cls, L"ApplicationFrameWindow") == 0) {
+        if (wcsstr(title, L"New notification") || wcsstr(title, L"Notification"))
+            return LooksLikeToastGeometry(hwnd);
+        return false;
+    }
+    // CoreWindow / InputSite are too broad alone — require geometry + title hint
+    if (_wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0 ||
+        _wcsicmp(cls, L"Windows.UI.Input.InputSite.WindowClass") == 0) {
+        bool titleHint =
+            wcsstr(title, L"New notification") != nullptr ||
+            wcsstr(title, L"Notification") != nullptr ||
+            wcsstr(title, L"Toast") != nullptr ||
+            title[0] == L'\0'; // many toasts have empty title
+        if (!titleHint) return false;
+        return LooksLikeToastGeometry(hwnd);
+    }
     return false;
 }
 
