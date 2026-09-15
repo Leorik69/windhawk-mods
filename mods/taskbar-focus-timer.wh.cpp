@@ -2,7 +2,7 @@
 // @id              taskbar-focus-timer
 // @name            Taskbar Focus Timer
 // @description     Pomodoro-style focus timer with tray icon, balloon tips, and Ctrl+Alt+F hotkey; optional clock-area wheel adjust
-// @version         1.0.0
+// @version         1.0.1
 // @author          Leorik69
 // @github          https://github.com/Leorik69
 // @include         explorer.exe
@@ -51,6 +51,12 @@ ships a solid tray + hotkey UX instead of depending on Taskbar.View internals.
 - hotkeyEnabled: true
   $name: Hotkey enabled
   $description: Register Ctrl+Alt+F to start/pause
+- showChip: true
+  $name: Show companion chip
+  $description: Tiny topmost MM:SS chip (off = tray + hotkey only)
+- clockWheelAdjust: true
+  $name: Clock-area wheel adjust
+  $description: Install WH_MOUSE_LL only when enabled; only acts over clock band
 */
 // ==/WindhawkModSettings==
 
@@ -67,6 +73,8 @@ static int g_workMinutes = 25;
 static int g_breakMinutes = 5;
 static bool g_showSeconds = true;
 static bool g_hotkeyEnabled = true;
+static bool g_showChip = true;
+static bool g_clockWheelAdjust = true;
 
 static const UINT WM_TRAYICON = WM_APP + 42;
 static const UINT WM_TICK = WM_APP + 43;
@@ -94,6 +102,8 @@ static void LoadSettings() {
     if (g_breakMinutes > 60) g_breakMinutes = 60;
     g_showSeconds = Wh_GetIntSetting(L"showSeconds") != 0;
     g_hotkeyEnabled = Wh_GetIntSetting(L"hotkeyEnabled") != 0;
+    g_showChip = Wh_GetIntSetting(L"showChip") != 0;
+    g_clockWheelAdjust = Wh_GetIntSetting(L"clockWheelAdjust") != 0;
     g_adjustMinutes = g_workMinutes;
 }
 
@@ -283,14 +293,17 @@ static LRESULT CALLBACK ChipWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             EndPaint(hwnd, &ps);
             return 0;
         }
+        case WM_LBUTTONDOWN: {
+            // Drag without HTCAPTION so LBUTTONUP still receives the click
+            ReleaseCapture();
+            SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, lParam);
+            return 0;
+        }
         case WM_LBUTTONUP:
             TogglePauseOrStart();
             return 0;
-        case WM_NCHITTEST: {
-            LRESULT hit = DefWindowProcW(hwnd, msg, wParam, lParam);
-            if (hit == HTCLIENT) return HTCAPTION; // drag companion chip
-            return hit;
-        }
+        case WM_NCHITTEST:
+            return HTCLIENT;
         case WM_DESTROY:
             return 0;
     }
@@ -394,7 +407,7 @@ BOOL Wh_ModInit() {
     }
 
     AddTrayIcon(g_msgWnd);
-    CreateChipWindow();
+    if (g_showChip) CreateChipWindow();
 
     if (g_hotkeyEnabled) {
         if (!RegisterHotKey(g_msgWnd, HOTKEY_ID, MOD_CONTROL | MOD_ALT, 'F'))
@@ -403,9 +416,13 @@ BOOL Wh_ModInit() {
             Wh_Log(L"Hotkey Ctrl+Alt+F registered");
     }
 
-    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, GetModuleHandleW(nullptr), 0);
-    if (!g_mouseHook)
-        Wh_Log(L"WH_MOUSE_LL hook failed; clock-wheel adjust disabled");
+    if (g_clockWheelAdjust) {
+        g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, GetModuleHandleW(nullptr), 0);
+        if (!g_mouseHook)
+            Wh_Log(L"WH_MOUSE_LL hook failed; clock-wheel adjust disabled");
+    } else {
+        Wh_Log(L"clock-wheel adjust off — no WH_MOUSE_LL");
+    }
 
     Wh_Log(L"taskbar-focus-timer init (work=%d break=%d)", g_workMinutes, g_breakMinutes);
     return TRUE;
@@ -433,12 +450,26 @@ void Wh_ModUninit() {
 
 void Wh_ModSettingsChanged() {
     bool prevHotkey = g_hotkeyEnabled;
+    bool prevChip = g_showChip;
+    bool prevWheel = g_clockWheelAdjust;
     LoadSettings();
     if (g_msgWnd) {
         if (prevHotkey && !g_hotkeyEnabled)
             UnregisterHotKey(g_msgWnd, HOTKEY_ID);
         else if (!prevHotkey && g_hotkeyEnabled)
             RegisterHotKey(g_msgWnd, HOTKEY_ID, MOD_CONTROL | MOD_ALT, 'F');
+    }
+    if (prevChip && !g_showChip && g_chipWnd) {
+        DestroyWindow(g_chipWnd);
+        g_chipWnd = nullptr;
+    } else if (!prevChip && g_showChip && !g_chipWnd) {
+        CreateChipWindow();
+    }
+    if (prevWheel && !g_clockWheelAdjust && g_mouseHook) {
+        UnhookWindowsHookEx(g_mouseHook);
+        g_mouseHook = nullptr;
+    } else if (!prevWheel && g_clockWheelAdjust && !g_mouseHook) {
+        g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, GetModuleHandleW(nullptr), 0);
     }
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
@@ -447,5 +478,4 @@ void Wh_ModSettingsChanged() {
     }
     UpdateTrayTooltip();
     UpdateChip();
-    Wh_Log(L"Settings changed");
 }
