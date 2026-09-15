@@ -36,6 +36,16 @@ VERSION_DEFINES = [
 ]
 
 # Mod @architecture value -> clang target triples.
+#
+# These are Windhawk's four supported @architecture values (see
+# windhawk-core domain/src/metadata.rs SUPPORTED_ARCHITECTURE), and the mapping
+# mirrors how Windhawk expands them to compile targets (domain/src/
+# compile_targets.rs targets_for_arch). Note that `x86-64` and `amd64` are NOT
+# the same: `amd64` is x64 only, while `x86-64` is the 64-bit umbrella that
+# Windhawk builds for BOTH x86_64 and aarch64 (it emits X86_64 then Aarch64 when
+# arm64 is enabled). We always include aarch64 for `x86-64` so the checker
+# matches what the catalog CI (scripts/compile_mod.py) actually compiles and
+# does not let arm64-only errors slip through.
 ARCH_TO_TRIPLES = {
     "x86": ["i686-w64-mingw32"],
     "amd64": ["x86_64-w64-mingw32"],
@@ -43,6 +53,8 @@ ARCH_TO_TRIPLES = {
     "x86-64": ["x86_64-w64-mingw32", "aarch64-w64-mingw32"],
 }
 
+# Default when a mod declares no @architecture: Windhawk uses [x86, x86-64],
+# which expands to i686 + x86_64 + aarch64.
 DEFAULT_TRIPLES = [
     "i686-w64-mingw32",
     "x86_64-w64-mingw32",
