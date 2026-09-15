@@ -1,4 +1,4 @@
 {
   "name": "windhawk-mods",
-  "install": "npm ci && python3 -m pip install --user pyyaml -r .github/requirements.txt"
+  "install": "python3 -m pip install --user -r .github/requirements.txt"
 }
