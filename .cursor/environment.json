@@ -1,0 +1,4 @@
+{
+  "name": "windhawk-mods",
+  "install": "python3 -m pip install --user -r .github/requirements.txt"
+}
